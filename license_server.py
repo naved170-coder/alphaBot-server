@@ -1,8 +1,9 @@
 """
-AlphaBot Cloud Server v3.0
+AlphaBot Cloud Server v3.1
 ============================
 Handles: License validation + Remote ON/OFF + 
          Real-time buyer monitoring + Trade reporting
+         + Real-time price feeds (Alpaca crypto + TwelveData forex)
 
 Deploy to Render.com (free):
   1. Create account at render.com

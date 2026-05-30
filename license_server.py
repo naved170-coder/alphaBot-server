@@ -13,21 +13,45 @@ Deploy to Render.com (free):
   6. Deploy - get URL like https://alphabot-ns.onrender.com
 """
 
-import json, os, hashlib
+import json, os, hashlib, time
 from datetime import datetime, date
 from pathlib import Path
 
-try:
-    from aiohttp import web
-except ImportError:
-    os.system("pip install aiohttp -q")
-    from aiohttp import web
+import aiohttp
+from aiohttp import web
 
 # ── CONFIG ─────────────────────────────────────────────────────────
 DATA_FILE    = Path("licenses_data.json")
 TRADES_FILE  = Path("trades_data.json")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "AlphaBot@Admin2024")
-VERSION      = "3.0"
+VERSION      = "3.1"
+
+# ── PRICE FEED CONFIG (keys from Render environment variables) ──────
+ALPACA_KEY     = os.environ.get("ALPACA_KEY", "")
+ALPACA_SECRET  = os.environ.get("ALPACA_SECRET", "")
+TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "")
+
+# Price cache so we stay within free API limits.
+# All buyers share these cached prices (one fetch serves everyone).
+PRICE_CACHE = {
+    "crypto": {"data": {}, "ts": 0},
+    "forex":  {"data": {}, "ts": 0},
+}
+CRYPTO_TTL = 5    # seconds - Alpaca allows frequent calls
+FOREX_TTL  = 60   # seconds - Twelve Data free tier is limited
+
+# Symbol maps
+ALPACA_CRYPTO = {
+    "BTC/USD": "BTC/USD", "ETH/USD": "ETH/USD", "BNB/USD": "BNB/USD",
+    "SOL/USD": "SOL/USD", "XRP/USD": "XRP/USD", "LTC/USD": "LTC/USD",
+    "DOGE/USD": "DOGE/USD", "AVAX/USD": "AVAX/USD"
+}
+TWELVE_FOREX = {
+    "EUR/USD": "EUR/USD", "GBP/USD": "GBP/USD", "USD/JPY": "USD/JPY",
+    "AUD/USD": "AUD/USD", "USD/CHF": "USD/CHF", "USD/CAD": "USD/CAD",
+    "NZD/USD": "NZD/USD", "EUR/GBP": "EUR/GBP", "XAU/USD": "XAU/USD",
+    "XAG/USD": "XAG/USD"
+}
 
 # ── STORAGE HELPERS ─────────────────────────────────────────────────
 def load_licenses():
@@ -50,9 +74,24 @@ def save_trades(data):
 
 def days_left(expiry_str):
     try:
-        exp = datetime.fromisoformat(expiry_str)
+        s = (expiry_str or "").strip()
+        if not s:
+            return -1
+        # JavaScript toISOString() ends with 'Z' (UTC). Strip it and any timezone
+        # so we compare as naive local datetimes (matches datetime.now()).
+        if s.endswith("Z"):
+            s = s[:-1]
+        # Drop fractional seconds if present (e.g. .000)
+        if "." in s:
+            s = s.split(".")[0]
+        # Drop explicit timezone offset like +05:00 if present
+        if "+" in s[11:]:
+            s = s[:11] + s[11:].split("+")[0]
+        exp = datetime.fromisoformat(s)
         return (exp - datetime.now()).days
-    except: return -1
+    except Exception as e:
+        print("days_left parse error:", expiry_str, e)
+        return -1
 
 # ── CORS ────────────────────────────────────────────────────────────
 @web.middleware
@@ -604,6 +643,100 @@ async def h_export_csv(req):
         headers={"Content-Disposition": "attachment; filename=alphabot_trades.csv"}
     )
 
+# ================================================================
+# PRICE FEED ENDPOINTS (real-time prices for all buyer bots)
+# ================================================================
+
+async def fetch_alpaca_crypto(symbols):
+    """Fetch real-time crypto prices from Alpaca. Keys hidden on server."""
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return {}
+    syms = ",".join(symbols)
+    url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/trades?symbols=" + syms
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        "accept": "application/json"
+    }
+    out = {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers, timeout=10) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    trades = d.get("trades", {})
+                    for sym, t in trades.items():
+                        out[sym] = {"price": t.get("p", 0), "ts": t.get("t","")}
+    except Exception as e:
+        print("Alpaca fetch error:", e)
+    return out
+
+async def fetch_twelve_forex(symbols):
+    """Fetch real forex/metal prices from Twelve Data. Keys hidden on server."""
+    if not TWELVEDATA_KEY:
+        return {}
+    syms = ",".join(symbols)
+    url = "https://api.twelvedata.com/price?symbol=" + syms + "&apikey=" + TWELVEDATA_KEY
+    out = {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=10) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    # Single symbol returns {"price":"x"}, multiple returns {"EUR/USD":{"price":"x"}}
+                    if "price" in d and len(symbols) == 1:
+                        out[symbols[0]] = {"price": float(d["price"])}
+                    else:
+                        for sym in symbols:
+                            if sym in d and isinstance(d[sym], dict) and "price" in d[sym]:
+                                out[sym] = {"price": float(d[sym]["price"])}
+    except Exception as e:
+        print("TwelveData fetch error:", e)
+    return out
+
+async def h_prices_crypto(req):
+    """Buyer bots call this for real-time crypto. Server-cached."""
+    now = time.time()
+    cache = PRICE_CACHE["crypto"]
+    if now - cache["ts"] < CRYPTO_TTL and cache["data"]:
+        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "source": "Alpaca"})
+    symbols = list(ALPACA_CRYPTO.values())
+    data = await fetch_alpaca_crypto(symbols)
+    if data:
+        cache["data"] = data
+        cache["ts"] = now
+        return web.json_response({"ok": True, "prices": data, "cached": False, "source": "Alpaca"})
+    # return stale cache if fetch failed
+    if cache["data"]:
+        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "stale": True, "source": "Alpaca"})
+    return web.json_response({"ok": False, "prices": {}, "message": "Alpaca key not set or unreachable"})
+
+async def h_prices_forex(req):
+    """Buyer bots call this for real forex/gold. Server-cached."""
+    now = time.time()
+    cache = PRICE_CACHE["forex"]
+    if now - cache["ts"] < FOREX_TTL and cache["data"]:
+        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "source": "TwelveData"})
+    symbols = list(TWELVE_FOREX.values())
+    data = await fetch_twelve_forex(symbols)
+    if data:
+        cache["data"] = data
+        cache["ts"] = now
+        return web.json_response({"ok": True, "prices": data, "cached": False, "source": "TwelveData"})
+    if cache["data"]:
+        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "stale": True, "source": "TwelveData"})
+    return web.json_response({"ok": False, "prices": {}, "message": "TwelveData key not set or unreachable"})
+
+async def h_prices_status(req):
+    """Check which price feeds are configured."""
+    return web.json_response({
+        "ok": True,
+        "alpaca_configured": bool(ALPACA_KEY and ALPACA_SECRET),
+        "twelvedata_configured": bool(TWELVEDATA_KEY),
+        "crypto_symbols": list(ALPACA_CRYPTO.keys()),
+        "forex_symbols": list(TWELVE_FOREX.keys())
+    })
+
 # ── APP SETUP ────────────────────────────────────────────────────────
 def create_app():
     app = web.Application(middlewares=[cors])
@@ -613,6 +746,11 @@ def create_app():
     app.router.add_post("/validate",        h_validate)
     app.router.add_post("/heartbeat",       h_heartbeat)
     app.router.add_post("/trades/send",     h_send_trades)
+
+    # Price feed endpoints (real-time, server-cached, keys hidden)
+    app.router.add_get ("/prices/crypto",   h_prices_crypto)
+    app.router.add_get ("/prices/forex",    h_prices_forex)
+    app.router.add_get ("/prices/status",   h_prices_status)
 
     # Admin (seller) endpoints
     app.router.add_get ("/admin/ping",      h_admin_ping)

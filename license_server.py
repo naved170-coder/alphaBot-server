@@ -787,8 +787,14 @@ async def fetch_alpaca_crypto_bars(symbol, rng):
         return None
     tf, limit = CHART_RANGES.get(rng, ("1Day", 90))
     import datetime as _dt
-    url = ("https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=" + symbol +
-           "&timeframe=" + tf + "&limit=" + str(limit))
+    import urllib.parse as _up
+    # Compute a start date far enough back for the range
+    days_back = {"24H": 2, "7D": 9, "15D": 18, "30D": 35, "90D": 100,
+                 "6M": 200, "1Y": 400, "5Y": 2000}.get(rng, 100)
+    start = (_dt.datetime.utcnow() - _dt.timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sym_enc = _up.quote(symbol, safe="")  # BTC/USD -> BTC%2FUSD
+    url = ("https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=" + sym_enc +
+           "&timeframe=" + tf + "&start=" + start + "&limit=" + str(limit) + "&sort=asc")
     headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET, "accept": "application/json"}
     try:
         async with aiohttp.ClientSession() as s:
@@ -801,6 +807,8 @@ async def fetch_alpaca_crypto_bars(symbol, rng):
                         out.append({"t": b.get("t"), "o": b.get("o"), "h": b.get("h"),
                                     "l": b.get("l"), "c": b.get("c"), "v": b.get("v", 0)})
                     return out
+                else:
+                    print("Alpaca crypto bars status:", r.status, await r.text())
     except Exception as e:
         print("Alpaca crypto bars error:", e)
     return None
@@ -809,9 +817,13 @@ async def fetch_alpaca_forex_bars(symbol, rng):
     if not ALPACA_KEY or not ALPACA_SECRET:
         return None
     tf, limit = CHART_RANGES.get(rng, ("1Day", 90))
+    import datetime as _dt
+    days_back = {"24H": 2, "7D": 9, "15D": 18, "30D": 35, "90D": 100,
+                 "6M": 200, "1Y": 400, "5Y": 2000}.get(rng, 100)
+    start = (_dt.datetime.utcnow() - _dt.timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     pair = symbol.replace("/", "")
     url = ("https://data.alpaca.markets/v1beta1/forex/rates?currency_pairs=" + pair +
-           "&timeframe=" + tf + "&limit=" + str(limit))
+           "&timeframe=" + tf + "&start=" + start + "&limit=" + str(limit) + "&sort=asc")
     headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET, "accept": "application/json"}
     try:
         async with aiohttp.ClientSession() as s:
@@ -827,6 +839,8 @@ async def fetch_alpaca_forex_bars(symbol, rng):
                         o = b.get("o", mid); h = b.get("h", mid); l = b.get("l", mid)
                         out.append({"t": b.get("t"), "o": o, "h": h, "l": l, "c": mid, "v": 0})
                     return out
+                else:
+                    print("Alpaca forex bars status:", r.status, await r.text())
     except Exception as e:
         print("Alpaca forex bars error:", e)
     return None

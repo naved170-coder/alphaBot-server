@@ -769,6 +769,87 @@ async def h_prices_forex(req):
         return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "stale": True, "source": "Alpaca"})
     return web.json_response({"ok": False, "prices": {}, "message": "Alpaca key not set or unreachable"})
 
+# ── HISTORICAL BARS FOR CHARTS (Alpaca) ─────────────────────────────
+# Maps chart range -> (alpaca timeframe, limit, days back)
+CHART_RANGES = {
+    "24H": ("15Min", 96),
+    "7D":  ("1Hour", 168),
+    "15D": ("4Hour", 90),
+    "30D": ("1Day", 30),
+    "90D": ("1Day", 90),
+    "6M":  ("1Day", 180),
+    "1Y":  ("1Day", 365),
+    "5Y":  ("1Week", 260),
+}
+
+async def fetch_alpaca_crypto_bars(symbol, rng):
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return None
+    tf, limit = CHART_RANGES.get(rng, ("1Day", 90))
+    import datetime as _dt
+    url = ("https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=" + symbol +
+           "&timeframe=" + tf + "&limit=" + str(limit))
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET, "accept": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers, timeout=15) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    bars = d.get("bars", {}).get(symbol, [])
+                    out = []
+                    for b in bars:
+                        out.append({"t": b.get("t"), "o": b.get("o"), "h": b.get("h"),
+                                    "l": b.get("l"), "c": b.get("c"), "v": b.get("v", 0)})
+                    return out
+    except Exception as e:
+        print("Alpaca crypto bars error:", e)
+    return None
+
+async def fetch_alpaca_forex_bars(symbol, rng):
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return None
+    tf, limit = CHART_RANGES.get(rng, ("1Day", 90))
+    pair = symbol.replace("/", "")
+    url = ("https://data.alpaca.markets/v1beta1/forex/rates?currency_pairs=" + pair +
+           "&timeframe=" + tf + "&limit=" + str(limit))
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET, "accept": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers, timeout=15) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    rates = d.get("rates", {}).get(pair, [])
+                    out = []
+                    for b in rates:
+                        mid = b.get("mp") or b.get("c")
+                        if mid is None:
+                            continue
+                        o = b.get("o", mid); h = b.get("h", mid); l = b.get("l", mid)
+                        out.append({"t": b.get("t"), "o": o, "h": h, "l": l, "c": mid, "v": 0})
+                    return out
+    except Exception as e:
+        print("Alpaca forex bars error:", e)
+    return None
+
+async def h_chart(req):
+    """Return real historical bars for a symbol+range. crypto+forex via Alpaca. Others: not available."""
+    symbol = req.query.get("symbol", "")
+    rng = req.query.get("range", "30D")
+    if symbol in ALPACA_CRYPTO:
+        bars = await fetch_alpaca_crypto_bars(symbol, rng)
+        if bars:
+            return web.json_response({"ok": True, "symbol": symbol, "range": rng, "bars": bars, "source": "Alpaca"})
+        return web.json_response({"ok": False, "symbol": symbol, "message": "No real chart data available for this range."})
+    fx_no_metal = symbol in TWELVE_FOREX and symbol not in ("XAU/USD", "XAG/USD")
+    if fx_no_metal:
+        bars = await fetch_alpaca_forex_bars(symbol, rng)
+        if bars:
+            return web.json_response({"ok": True, "symbol": symbol, "range": rng, "bars": bars, "source": "Alpaca"})
+        return web.json_response({"ok": False, "symbol": symbol, "message": "No real chart data available for this range."})
+    # Metals + PSX + indices: no real source
+    return web.json_response({"ok": False, "symbol": symbol, "message": "Real chart data not available for this symbol."})
+
+
 
 async def h_prices_status(req):
     """Check which price feeds are configured."""
@@ -795,6 +876,7 @@ def create_app():
     app.router.add_get ("/prices/crypto",   h_prices_crypto)
     app.router.add_get ("/prices/forex",    h_prices_forex)
     app.router.add_get ("/prices/status",   h_prices_status)
+    app.router.add_get ("/chart",           h_chart)
 
     # Admin (seller) endpoints
     app.router.add_get ("/admin/ping",      h_admin_ping)

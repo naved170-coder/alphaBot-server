@@ -38,8 +38,8 @@ PRICE_CACHE = {
     "crypto": {"data": {}, "ts": 0},
     "forex":  {"data": {}, "ts": 0},
 }
-CRYPTO_TTL = 5    # seconds - Alpaca allows frequent calls
-FOREX_TTL  = 60   # seconds - Twelve Data free tier is limited
+CRYPTO_TTL = 2    # seconds - fast updates (Alpaca allows 10k/min)
+FOREX_TTL  = 3    # seconds - Alpaca forex rates, fast updates
 
 # Symbol maps
 ALPACA_CRYPTO = {
@@ -672,8 +672,40 @@ async def fetch_alpaca_crypto(symbols):
         print("Alpaca fetch error:", e)
     return out
 
+async def fetch_alpaca_forex(symbols):
+    """Fetch real forex/metal rates from Alpaca currency API. Uses same Alpaca keys."""
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return {}
+    # Alpaca forex rates: symbols like EURUSD (no slash). Metals XAU/XAG not on Alpaca forex.
+    fx = [s for s in symbols if s not in ("XAU/USD", "XAG/USD")]
+    pairs = ",".join([s.replace("/", "") for s in fx])
+    if not pairs:
+        return {}
+    url = "https://data.alpaca.markets/v1beta1/forex/latest/rates?currency_pairs=" + pairs
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        "accept": "application/json"
+    }
+    out = {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers, timeout=10) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    rates = d.get("rates", {})
+                    for pair_nodash, info in rates.items():
+                        # convert EURUSD -> EUR/USD
+                        sym = pair_nodash[:3] + "/" + pair_nodash[3:]
+                        mid = info.get("mp") or info.get("bp") or info.get("ap")
+                        if mid:
+                            out[sym] = {"price": float(mid)}
+    except Exception as e:
+        print("Alpaca forex fetch error:", e)
+    return out
+
 async def fetch_twelve_forex(symbols):
-    """Fetch real forex/metal prices from Twelve Data. Keys hidden on server."""
+    """Fallback: Fetch real forex/metal prices from Twelve Data. Keys hidden on server."""
     if not TWELVEDATA_KEY:
         return {}
     syms = ",".join(symbols)
@@ -713,20 +745,30 @@ async def h_prices_crypto(req):
     return web.json_response({"ok": False, "prices": {}, "message": "Alpaca key not set or unreachable"})
 
 async def h_prices_forex(req):
-    """Buyer bots call this for real forex/gold. Server-cached."""
+    """Buyer bots call this for real forex/gold. Alpaca first, TwelveData fallback for metals."""
     now = time.time()
     cache = PRICE_CACHE["forex"]
     if now - cache["ts"] < FOREX_TTL and cache["data"]:
-        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "source": "TwelveData"})
+        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "source": "Alpaca"})
     symbols = list(TWELVE_FOREX.values())
-    data = await fetch_twelve_forex(symbols)
+    # Alpaca for currency pairs (real-time, fast)
+    data = await fetch_alpaca_forex(symbols)
+    src = "Alpaca"
+    # TwelveData for metals (XAU/XAG) which Alpaca forex does not cover, if key set
+    metals = [s for s in symbols if s in ("XAU/USD", "XAG/USD")]
+    if metals and TWELVEDATA_KEY:
+        td = await fetch_twelve_forex(metals)
+        if td:
+            data.update(td)
+            src = "Alpaca+TwelveData"
     if data:
         cache["data"] = data
         cache["ts"] = now
-        return web.json_response({"ok": True, "prices": data, "cached": False, "source": "TwelveData"})
+        return web.json_response({"ok": True, "prices": data, "cached": False, "source": src})
     if cache["data"]:
-        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "stale": True, "source": "TwelveData"})
-    return web.json_response({"ok": False, "prices": {}, "message": "TwelveData key not set or unreachable"})
+        return web.json_response({"ok": True, "prices": cache["data"], "cached": True, "stale": True, "source": "Alpaca"})
+    return web.json_response({"ok": False, "prices": {}, "message": "Alpaca key not set or unreachable"})
+
 
 async def h_prices_status(req):
     """Check which price feeds are configured."""
@@ -734,6 +776,7 @@ async def h_prices_status(req):
         "ok": True,
         "alpaca_configured": bool(ALPACA_KEY and ALPACA_SECRET),
         "twelvedata_configured": bool(TWELVEDATA_KEY),
+        "forex_via_alpaca": bool(ALPACA_KEY and ALPACA_SECRET),
         "crypto_symbols": list(ALPACA_CRYPTO.keys()),
         "forex_symbols": list(TWELVE_FOREX.keys())
     })
